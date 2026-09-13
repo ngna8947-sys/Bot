@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════
-BOT_TOKEN          = "8875643462:AAGGeHvUl_bJsd1E2Y5kFJBF_S78bl9ZtKo"
-ADMIN_ID           = 8807182741
+BOT_TOKEN          = "8555572237:AAH80oACZLEo8BiHiy3Sb8tF0gyy7nWJvQI"
+ADMIN_ID           = 5915683588
 
 # Bakong KHQR Config
 BAKONG_TOKEN       = "rbkMVUSQPooaey51jm1cD5ECnzmHyeNX7fBX4Afc16GU8k"
