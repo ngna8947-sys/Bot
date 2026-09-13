@@ -1,4 +1,5 @@
-import json, logging, time, os, sys, subprocess, threading, io
+import json, logging, time, os, sys, subprocess, threading, io, hashlib
+import requests as http_req
 import telebot
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
@@ -71,26 +72,60 @@ def ded_bal(uid, amt):
     _save(WALLETS_FILE, wallets)
 
 # ═══════════════════════════════════════════════════════════
-#  BAKONG KHQR
+#  STANDALONE KHQR GENERATOR (EMVCo Native - គ្មាន Error)
 # ═══════════════════════════════════════════════════════════
-def _generate_khqr(uid, amount, note=""):
-    try:
-        from bakong_khqr import KHQR
-        k = KHQR(BAKONG_TOKEN)
-        return k.create_qr(
-            bank_account=BANK_ACCOUNT, merchant_name=MERCHANT_NAME,
-            merchant_city=MERCHANT_CITY, amount=round(float(amount), 2),
-            currency="USD", bill_number=(note or f"uid{uid}")[:25], static=False
-        ) or ""
-    except Exception as e:
-        logger.error(f"[_generate_khqr] Error: {e}")
-        return ""
+def _crc16(data: str) -> str:
+    crc = 0xFFFF
+    for ch in data.encode('ascii'):
+        crc ^= (ch << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return f"{crc:04X}"
 
-def _check_bakong(md5, amount, start_ts):
+def _format_tag(tag: str, val: str) -> str:
+    return f"{tag}{len(val):02d}{val}"
+
+def _generate_khqr_native(amount: float, bill_no: str = "") -> str:
+    # Sub-tags សម្រាប់ Merchant Account (Tag 29 - Bakong)
+    sub29 = (
+        _format_tag("00", BANK_ACCOUNT) +
+        _format_tag("01", BANK_ACCOUNT)
+    )
+    amt_str = f"{amount:.2f}"
+    
+    # EMVCo Data String
+    payload = (
+        _format_tag("00", "01") +                # Payload Format Indicator
+        _format_tag("01", "12") +                # 12 = Dynamic QR
+        _format_tag("29", sub29) +               # Merchant Account Information
+        _format_tag("52", "5999") +              # Merchant Category Code
+        _format_tag("53", "840") +               # Currency = 840 (USD)
+        _format_tag("54", amt_str) +             # Transaction Amount
+        _format_tag("58", "KH") +                # Country Code
+        _format_tag("59", MERCHANT_NAME) +       # Merchant Name
+        _format_tag("60", MERCHANT_CITY)         # Merchant City
+    )
+    if bill_no:
+        sub62 = _format_tag("01", bill_no[:25])
+        payload += _format_tag("62", sub62)      # Additional Data Field
+        
+    payload_to_crc = payload + "6304"
+    return payload_to_crc + _crc16(payload_to_crc)
+
+def _check_bakong(md5):
     try:
-        from bakong_khqr import KHQR as _BK
-        return _BK(BAKONG_TOKEN).check_payment(str(md5)) == "PAID"
-    except Exception: return False
+        url = "https://api-bakong.nbc.gov.kh/v1/check_transaction_by_md5"
+        headers = {"Authorization": f"Bearer {BAKONG_TOKEN}", "Content-Type": "application/json"}
+        r = http_req.post(url, json={"md5": str(md5)}, headers=headers, timeout=10)
+        if r.ok:
+            res = r.json()
+            return res.get("responseCode") == 0 or res.get("data", {}).get("status") == "SUCCESS"
+    except Exception as e:
+        logger.error(f"Check Bakong Error: {e}")
+    return False
 
 def _watch_deposit(uid, uid_str, dep_id, amount, start_ts):
     deadline = time.time() + DEPOSIT_EXPIRE_SEC + 60
@@ -98,7 +133,7 @@ def _watch_deposit(uid, uid_str, dep_id, amount, start_ts):
         dep = store_deps.get(dep_id)
         if not dep or dep.get("status") != "pending": return
         md5 = dep.get("md5", "")
-        if _check_bakong(md5, amount, start_ts):
+        if _check_bakong(md5):
             add_bal(uid, round(amount, 2))
             store_deps[dep_id]["status"] = "confirmed"
             _save(STORE_DEP_FILE, store_deps)
@@ -117,17 +152,15 @@ def _watch_deposit(uid, uid_str, dep_id, amount, start_ts):
 
 def _send_deposit_qr(uid, amount):
     uid_str = str(uid)
-    qr_str = _generate_khqr(uid, amount, f"uid={uid} ${amount}")
-    if not qr_str:
-        bot.send_message(uid, "⚠️ មានបញ្ហាបង្កើត QR! សូមទាក់ទង Admin"); return
-
+    bill_no = f"uid{uid}_{int(time.time())%10000}"
     try:
-        from bakong_khqr import KHQR as _BK
-        md5_hash = _BK(BAKONG_TOKEN).generate_md5(qr_str)
-    except Exception:
-        import hashlib
-        md5_hash = hashlib.md5(qr_str.encode()).hexdigest()
+        qr_str = _generate_khqr_native(amount, bill_no)
+    except Exception as e:
+        logger.error(f"Generate QR Error: {e}")
+        bot.send_message(uid, "⚠️ មានបញ្ហាបង្កើត QR! សូមទាក់ទង Admin")
+        return
 
+    md5_hash = hashlib.md5(qr_str.encode("utf-8")).hexdigest()
     dep_id = f"dep_{uid}_{int(time.time())}"
     store_deps[dep_id] = {"uid": uid_str, "amount": amount, "status": "pending", "md5": md5_hash, "qr_str": qr_str}
     _save(STORE_DEP_FILE, store_deps)
@@ -145,9 +178,12 @@ def _send_deposit_qr(uid, amount):
 
     try:
         qr = qrcode.QRCode(box_size=6, border=2)
-        qr.add_data(qr_str); qr.make(fit=True)
+        qr.add_data(qr_str)
+        qr.make(fit=True)
         img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-        buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
         bot.send_photo(uid, buf, caption=cap)
     except Exception:
         bot.send_message(uid, cap + f"\n\n<code>{qr_str}</code>")
@@ -284,7 +320,6 @@ def handle_callbacks(call):
             try: bot.send_message(target_uid, "❌ សំណើដាក់ប្រាក់របស់អ្នកត្រូវបានបដិសេធ។")
             except: pass
 
-    # Admin ជ្រើសរើសប្រភេទរឿង
     elif data.startswith("set_access:"):
         if uid != ADMIN_ID: return
         _, access_type = data.split(":")
@@ -329,7 +364,6 @@ def handle_callbacks(call):
                                       reply_markup=movies_list_kb(f_type, int(page_str)))
         bot.answer_callback_query(call.id)
 
-    # ភ្ញៀវចុចលើរឿងដើម្បីមើលព័ត៌មាន និងតម្លៃ
     elif data.startswith("view_movie:"):
         mid = data.split(":")[1]
         movie = movies_db.get(mid)
@@ -341,7 +375,6 @@ def handle_callbacks(call):
         is_free = (movie.get("access") == "free")
         price = float(movie.get("price", 0.0))
 
-        # ប្រសិនបើជារឿង Free ឬ Admin ចុចមើល ផ្ញើវីដេអូជូនភ្លាម
         if is_free or uid == ADMIN_ID:
             movie["views"] = movie.get("views", 0) + 1
             _save(MOVIES_FILE, movies_db)
@@ -353,7 +386,6 @@ def handle_callbacks(call):
                 bot.send_message(uid, caption, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ ទស្សនា", url=movie["link"])]]))
             return
 
-        # បើជារឿង VIP បង្ហាញតម្លៃឱ្យភ្ញៀវឃើញសិន
         preview_txt = (
             f"🎬 <b>{title}</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -370,7 +402,6 @@ def handle_callbacks(call):
         ])
         bot.send_message(uid, preview_txt, reply_markup=kb)
 
-    # ភ្ញៀវចុចប៊ូតុងទូទាត់ដើម្បីមើល
     elif data.startswith("buy_movie:"):
         mid = data.split(":")[1]
         movie = movies_db.get(mid)
@@ -380,7 +411,6 @@ def handle_callbacks(call):
         price = float(movie.get("price", 0.0))
         user_bal = bal(uid)
 
-        # ឆែកលុយក្នុងកាបូប
         if user_bal < price:
             bot.answer_callback_query(call.id, "❌ សាច់ប្រាក់របស់អ្នកមិនគ្រប់គ្រាន់ទេ!", show_alert=True)
             bot.send_message(uid, 
@@ -391,13 +421,11 @@ def handle_callbacks(call):
                 reply_markup=deposit_amt_kb())
             return
 
-        # កាត់លុយ
         ded_bal(uid, price)
         movie["views"] = movie.get("views", 0) + 1
         _save(MOVIES_FILE, movies_db)
         bot.answer_callback_query(call.id, f"✅ ទូទាត់ជោគជ័យ -${price:.2f}")
 
-        # ផ្ញើសារជូនដំណឹងដល់ Admin
         try:
             bot.send_message(ADMIN_ID, f"🍿 <b>ភ្ញៀវទិញរឿងទស្សនា!</b>\n👤 <code>{uid}</code>\n🎬 {movie['title']}\n💰 +${price:.2f}")
         except: pass
@@ -467,7 +495,6 @@ def handle_messages(message):
         bot.send_message(uid, "🏠 ត្រឡប់មក Menu ដើមវិញ", reply_markup=admin_kb() if uid == ADMIN_ID else user_kb())
         return
 
-    # Admin ដាក់តម្លៃលើរឿង VIP
     if isinstance(step, dict) and step.get("step") == "enter_movie_price":
         try:
             price = round(float(text.replace("$", "")), 2)
@@ -572,7 +599,7 @@ def handle_messages(message):
         btns = []
         for mid, m in results:
             badge = "🎁" if m.get("access") == "free" else f"🔒 ${m.get('price', 0):.2f}"
-            btns.append([InlineKeyboardButton(f"{m['title']} ({badge})", callback_data=f"view_movie:{mid}")])
+            btns.append([InlineKeyboardButton(f"{badge} {m['title']}", callback_data=f"view_movie:{mid}")])
         bot.send_message(uid, f"✅ រកឃើញចំនួន <b>{len(results)}</b> រឿង:", reply_markup=InlineKeyboardMarkup(btns))
         return
 
@@ -656,7 +683,7 @@ def handle_messages(message):
 # ═══════════════════════════════════════════════════════════
 flask_app = Flask(__name__)
 @flask_app.route("/health")
-def health(): return jsonify({"status": "running", "type": "Movie Bot Pay-Per-View"})
+def health(): return jsonify({"status": "running", "type": "Movie Bot Native KHQR"})
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=5055, debug=False, use_reloader=False)
