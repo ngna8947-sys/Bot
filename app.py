@@ -7,28 +7,16 @@ from telebot.types import (
 )
 from flask import Flask, jsonify
 
-# ─── Auto-install deps ───
-def _ensure_deps():
-    pkgs = {"PIL": "pillow", "qrcode": "qrcode"}
-    for mod, pkg in pkgs.items():
-        try: __import__(mod)
-        except ImportError:
-            subprocess.run([sys.executable, "-m", "pip", "install", pkg,
-                            "--break-system-packages", "-q"], check=False)
-_ensure_deps()
-
-import qrcode
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════
-BOT_TOKEN          = "8555572237:AAH80oACZLEo8BiHiy3Sb8tF0gyy7nWJvQI"
-ADMIN_ID           = 5915683588
+BOT_TOKEN          = "8875643462:AAGGeHvUl_bJsd1E2Y5kFJBF_S78bl9ZtKo"
+ADMIN_ID           = 8807182741
 
-# Bakong KHQR
+# Bakong KHQR Config
 BAKONG_TOKEN       = "rbkMVUSQPooaey51jm1cD5ECnzmHyeNX7fBX4Afc16GU8k"
 BANK_ACCOUNT       = "samnang_mon@bkrt"
 MERCHANT_NAME      = "Smey Lov"
@@ -72,46 +60,36 @@ def ded_bal(uid, amt):
     _save(WALLETS_FILE, wallets)
 
 # ═══════════════════════════════════════════════════════════
-#  STANDALONE KHQR GENERATOR (EMVCo Native - គ្មាន Error)
+#  STANDALONE KHQR (EMVCo Native — មិនបាច់ប្រើ Library ក្រៅ)
 # ═══════════════════════════════════════════════════════════
 def _crc16(data: str) -> str:
     crc = 0xFFFF
     for ch in data.encode('ascii'):
         crc ^= (ch << 8)
         for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
+            if crc & 0x8000: crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else: crc = (crc << 1) & 0xFFFF
     return f"{crc:04X}"
 
 def _format_tag(tag: str, val: str) -> str:
     return f"{tag}{len(val):02d}{val}"
 
 def _generate_khqr_native(amount: float, bill_no: str = "") -> str:
-    # Sub-tags សម្រាប់ Merchant Account (Tag 29 - Bakong)
-    sub29 = (
-        _format_tag("00", BANK_ACCOUNT) +
-        _format_tag("01", BANK_ACCOUNT)
-    )
+    sub29 = _format_tag("00", BANK_ACCOUNT) + _format_tag("01", BANK_ACCOUNT)
     amt_str = f"{amount:.2f}"
-    
-    # EMVCo Data String
     payload = (
-        _format_tag("00", "01") +                # Payload Format Indicator
-        _format_tag("01", "12") +                # 12 = Dynamic QR
-        _format_tag("29", sub29) +               # Merchant Account Information
-        _format_tag("52", "5999") +              # Merchant Category Code
-        _format_tag("53", "840") +               # Currency = 840 (USD)
-        _format_tag("54", amt_str) +             # Transaction Amount
-        _format_tag("58", "KH") +                # Country Code
-        _format_tag("59", MERCHANT_NAME) +       # Merchant Name
-        _format_tag("60", MERCHANT_CITY)         # Merchant City
+        _format_tag("00", "01") +
+        _format_tag("01", "12") +
+        _format_tag("29", sub29) +
+        _format_tag("52", "5999") +
+        _format_tag("53", "840") +
+        _format_tag("54", amt_str) +
+        _format_tag("58", "KH") +
+        _format_tag("59", MERCHANT_NAME) +
+        _format_tag("60", MERCHANT_CITY)
     )
     if bill_no:
-        sub62 = _format_tag("01", bill_no[:25])
-        payload += _format_tag("62", sub62)      # Additional Data Field
-        
+        payload += _format_tag("62", _format_tag("01", bill_no[:25]))
     payload_to_crc = payload + "6304"
     return payload_to_crc + _crc16(payload_to_crc)
 
@@ -177,6 +155,7 @@ def _send_deposit_qr(uid, amount):
     except: pass
 
     try:
+        import qrcode
         qr = qrcode.QRCode(box_size=6, border=2)
         qr.add_data(qr_str)
         qr.make(fit=True)
@@ -185,7 +164,8 @@ def _send_deposit_qr(uid, amount):
         img.save(buf, format="PNG")
         buf.seek(0)
         bot.send_photo(uid, buf, caption=cap)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Render QR Image Error: {e}")
         bot.send_message(uid, cap + f"\n\n<code>{qr_str}</code>")
 
     threading.Thread(target=_watch_deposit, args=(uid, uid_str, dep_id, amount, int(time.time())), daemon=True).start()
@@ -218,8 +198,7 @@ def deposit_amt_kb():
     btns, row = [], []
     for a in amts:
         row.append(InlineKeyboardButton(f"${a}", callback_data=f"dep:{a}"))
-        if len(row) == 3:
-            btns.append(row); row = []
+        if len(row) == 3: btns.append(row); row = []
     if row: btns.append(row)
     btns.append([InlineKeyboardButton("✏️ បញ្ចូលចំនួនផ្ទាល់ខ្លួន", callback_data="dep:custom")])
     return InlineKeyboardMarkup(btns)
@@ -227,25 +206,17 @@ def deposit_amt_kb():
 def movies_list_kb(filter_type="all", page=0, per_page=6):
     items = []
     for mid, m in movies_db.items():
-        if filter_type == "free" and m.get("access") == "free":
-            items.append((mid, m))
-        elif filter_type == "vip" and m.get("access") != "free":
-            items.append((mid, m))
-        elif filter_type == "all":
-            items.append((mid, m))
+        if filter_type == "free" and m.get("access") == "free": items.append((mid, m))
+        elif filter_type == "vip" and m.get("access") != "free": items.append((mid, m))
+        elif filter_type == "all": items.append((mid, m))
 
     total_pages = max(1, (len(items) + per_page - 1) // per_page)
-    start = page * per_page
-    end = start + per_page
-    
+    start, end = page * per_page, (page + 1) * per_page
     btns = []
     for mid, m in items[start:end]:
         title = m.get("title", "វីដេអូរឿង")
-        if m.get("access") == "free":
-            label = f"🎁 {title} (Free)"
-        else:
-            price = float(m.get("price", 0.0))
-            label = f"🔒 {title} (${price:.2f})"
+        if m.get("access") == "free": label = f"🎁 {title} (Free)"
+        else: label = f"🔒 {title} (${float(m.get('price', 0.0)):.2f})"
         btns.append([InlineKeyboardButton(label, callback_data=f"view_movie:{mid}")])
     
     nav = []
@@ -328,14 +299,9 @@ def handle_callbacks(call):
             if access_type == "free":
                 mid = f"m_{int(time.time())}"
                 movies_db[mid] = {
-                    "title": step["title"],
-                    "type": "video",
-                    "file_id": step["file_id"],
-                    "access": "free",
-                    "price": 0.0,
-                    "desc": step["title"],
-                    "views": 0,
-                    "date": int(time.time())
+                    "title": step["title"], "type": "video", "file_id": step["file_id"],
+                    "access": "free", "price": 0.0, "desc": step["title"],
+                    "views": 0, "date": int(time.time())
                 }
                 _save(MOVIES_FILE, movies_db)
                 waiting.pop(uid, None)
@@ -344,15 +310,10 @@ def handle_callbacks(call):
                                       chat_id=uid, message_id=call.message.message_id)
                 bot.send_message(uid, "💡 ភ្ញៀវអាចទស្សនាបានដោយសេរី!", reply_markup=admin_kb())
             else:
-                waiting[uid] = {
-                    "step": "enter_movie_price",
-                    "title": step["title"],
-                    "file_id": step["file_id"]
-                }
+                waiting[uid] = {"step": "enter_movie_price", "title": step["title"], "file_id": step["file_id"]}
                 bot.answer_callback_query(call.id)
                 bot.edit_message_text(
-                    f"🎬 រឿង: <b>{step['title']}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🎬 រឿង: <b>{step['title']}</b>\n━━━━━━━━━━━━━━━━━━\n"
                     f"💰 សូមវាយ <b>តម្លៃរឿង (USD)</b> ដែលភ្ញៀវត្រូវបង់ដើម្បីមើល:\n"
                     f"<i>(ឧទាហរណ៍៖ <code>0.25</code> ឬ <code>0.50</code> ឬ <code>1.00</code>)</i>",
                     chat_id=uid, message_id=call.message.message_id
@@ -387,14 +348,10 @@ def handle_callbacks(call):
             return
 
         preview_txt = (
-            f"🎬 <b>{title}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🏷️ ប្រភេទ: <b>🔒 VIP Movie</b>\n"
-            f"💰 តម្លៃទស្សនា: <b>${price:.2f}</b>\n"
-            f"💳 សាច់ប្រាក់របស់អ្នក: <b>${bal(uid):.2f}</b>\n"
-            f"👁 ទស្សនា: {movie.get('views', 0)} ដង\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💡 ចុចប៊ូតុងខាងក្រោមដើម្បីទូទាត់ទស្សនាវីដេអូនេះ៖"
+            f"🎬 <b>{title}</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ ប្រភេទ: <b>🔒 VIP Movie</b>\n💰 តម្លៃទស្សនា: <b>${price:.2f}</b>\n"
+            f"💳 សាច់ប្រាក់របស់អ្នក: <b>${bal(uid):.2f}</b>\n👁 ទស្សនា: {movie.get('views', 0)} ដង\n"
+            f"━━━━━━━━━━━━━━━━━━\n💡 ចុចប៊ូតុងខាងក្រោមដើម្បីទូទាត់ទស្សនាវីដេអូនេះ៖"
         )
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"🔓 ទូទាត់ ${price:.2f} ដើម្បីទស្សនា", callback_data=f"buy_movie:{mid}")],
@@ -414,10 +371,8 @@ def handle_callbacks(call):
         if user_bal < price:
             bot.answer_callback_query(call.id, "❌ សាច់ប្រាក់របស់អ្នកមិនគ្រប់គ្រាន់ទេ!", show_alert=True)
             bot.send_message(uid, 
-                f"❌ <b>សាច់ប្រាក់មិនគ្រប់គ្រាន់!</b>\n"
-                f"💰 តម្លៃរឿង: <b>${price:.2f}</b>\n"
-                f"💳 សាច់ប្រាក់បច្ចុប្បន្ន: <b>${user_bal:.2f}</b>\n\n"
-                f"👉 សូមចុចប៊ូតុង <b>💳 ដាក់ប្រាក់</b> ជាមុនសិន។",
+                f"❌ <b>សាច់ប្រាក់មិនគ្រប់គ្រាន់!</b>\n💰 តម្លៃរឿង: <b>${price:.2f}</b>\n"
+                f"💳 សាច់ប្រាក់បច្ចុប្បន្ន: <b>${user_bal:.2f}</b>\n\n👉 សូមចុចប៊ូតុង <b>💳 ដាក់ប្រាក់</b> ជាមុនសិន។",
                 reply_markup=deposit_amt_kb())
             return
 
@@ -431,11 +386,8 @@ def handle_callbacks(call):
         except: pass
 
         caption = (
-            f"🎬 <b>{movie['title']}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"✅ បានទូទាត់: <b>${price:.2f}</b>\n"
-            f"💳 សាច់ប្រាក់នៅសល់: <b>${bal(uid):.2f}</b>\n"
-            f"🍿 សូមរីករាយទស្សនា!"
+            f"🎬 <b>{movie['title']}</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"✅ បានទូទាត់: <b>${price:.2f}</b>\n💳 សាច់ប្រាក់នៅសល់: <b>${bal(uid):.2f}</b>\n🍿 សូមរីករាយទស្សនា!"
         )
         if movie.get("type") == "video" and movie.get("file_id"):
             try: bot.send_video(uid, movie["file_id"], caption=caption, parse_mode=None)
@@ -475,11 +427,7 @@ def handle_video(message):
             bot.send_message(uid, f"🎬 ចំណងជើង: <b>{caption_title}</b>\n\nតើរឿងនេះជាប្រភេទអ្វី?", reply_markup=kb)
         else:
             waiting[uid] = {"step": "add_movie_title", "file_id": file_id}
-            bot.send_message(uid, 
-                "📥 <b>បានទទួលវីដេអូរួចរាល់!</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "📝 សូមវាយ <b>ចំណងជើងរឿង</b> រួចផ្ញើមកទីនេះ:", 
-                reply_markup=cancel_kb())
+            bot.send_message(uid, "📥 <b>បានទទួលវីដេអូរួចរាល់!</b>\n━━━━━━━━━━━━━━━━━━\n📝 សូមវាយ <b>ចំណងជើងរឿង</b> រួចផ្ញើមកទីនេះ:", reply_markup=cancel_kb())
 
 # ═══════════════════════════════════════════════════════════
 #  TEXT MESSAGES HANDLER
@@ -505,22 +453,15 @@ def handle_messages(message):
         
         mid = f"m_{int(time.time())}"
         movies_db[mid] = {
-            "title": step["title"],
-            "type": "video",
-            "file_id": step["file_id"],
-            "access": "vip",
-            "price": price,
-            "desc": step["title"],
-            "views": 0,
-            "date": int(time.time())
+            "title": step["title"], "type": "video", "file_id": step["file_id"],
+            "access": "vip", "price": price, "desc": step["title"],
+            "views": 0, "date": int(time.time())
         }
         _save(MOVIES_FILE, movies_db)
         waiting.pop(uid, None)
         bot.send_message(uid, 
-            f"✅ <b>បានបញ្ចូលរឿង VIP ជោគជ័យ!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🎬 ចំណងជើង: <b>{step['title']}</b>\n"
-            f"💰 តម្លៃ: <b>${price:.2f}</b>\n"
+            f"✅ <b>បានបញ្ចូលរឿង VIP ជោគជ័យ!</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🎬 ចំណងជើង: <b>{step['title']}</b>\n💰 តម្លៃ: <b>${price:.2f}</b>\n"
             f"💡 ភ្ញៀវនឹងឃើញតម្លៃនេះពេលចុចមើល!", reply_markup=admin_kb())
         return
 
@@ -550,16 +491,14 @@ def handle_messages(message):
         vip_movies = [m for m in movies_db.values() if m.get("access") != "free"]
         if not vip_movies:
             bot.send_message(uid, "❌ មិនទាន់មានរឿង VIP នៅឡើយទេ!"); return
-        bot.send_message(uid, "🎬 <b>ជ្រើសរើសរឿង VIP៖</b>", 
-                         reply_markup=movies_list_kb(filter_type="vip", page=0))
+        bot.send_message(uid, "🎬 <b>ជ្រើសរើសរឿង VIP៖</b>", reply_markup=movies_list_kb(filter_type="vip", page=0))
         return
 
     if text == "🎁 រឿង Free":
         free_movies = [m for m in movies_db.values() if m.get("access") == "free"]
         if not free_movies:
             bot.send_message(uid, "❌ មិនទាន់មានរឿង Free នៅឡើយទេ!"); return
-        bot.send_message(uid, "🎁 <b>ជ្រើសរើសរឿង Free (ទស្សនាឥតគិតថ្លៃ)៖</b>", 
-                         reply_markup=movies_list_kb(filter_type="free", page=0))
+        bot.send_message(uid, "🎁 <b>ជ្រើសរើសរឿង Free (ទស្សនាឥតគិតថ្លៃ)៖</b>", reply_markup=movies_list_kb(filter_type="free", page=0))
         return
 
     if text in ("👜 កាបូបលុយ", "👜 Wallet"):
@@ -633,11 +572,7 @@ def handle_messages(message):
 
         if text == "➕ បន្ថែមរឿងថ្មី":
             waiting[uid] = "add_movie_video"
-            bot.send_message(uid, 
-                "📤 <b>សូមផ្ញើ ឬ Forward វីដេអូរឿងចូលទីនេះ៖</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "💡 <i>អ្នកអាចជ្រើសរើស VIP រួចកំណត់តម្លៃវីដេអូបាននៅជំហានបន្ទាប់។</i>", 
-                reply_markup=cancel_kb())
+            bot.send_message(uid, "📤 <b>សូមផ្ញើ ឬ Forward វីដេអូរឿងចូលទីនេះ៖</b>\n━━━━━━━━━━━━━━━━━━\n💡 <i>អ្នកអាចជ្រើសរើស VIP រួចកំណត់តម្លៃវីដេអូបាននៅជំហានបន្ទាប់។</i>", reply_markup=cancel_kb())
             return
 
         if text == "🎬 គ្រប់គ្រងរឿង":
